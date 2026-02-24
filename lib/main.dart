@@ -21,10 +21,11 @@ const String kBroadcastIp = '192.168.31.255';
 /// MAC-адрес сетевой карты ПК (в формате "AA:BB:CC:DD:EE:FF")
 const String kPcMac = '70:85:C2:DA:3D:A3';
 
-/// UDP-порт, на котором слушает сервер на ПК (должен совпадать с портом в Python-сервере)
+/// UDP-порт, на котором слушает сервер на ПК (Python-скрипт принимает команду "SHUTDOWN").
+/// По этому порту только отправляется команда выключения, проверка «включён ли ПК» — по kTcpCheckPort.
 const int kUdpPort = 9999;
 
-/// TCP-порт для проверки состояния (например, 445 – общий доступ к файлам)
+/// TCP-порт для проверки «включён ли ПК» (доступность хоста). Например 445 (SMB) или 80 (HTTP).
 const int kTcpCheckPort = 445;
 
 /// Команда, которую ожидает UDP-сервер (можно дополнить паролем)
@@ -34,12 +35,80 @@ const String kShutdownCommand = 'SHUTDOWN';
 const int kConnectTimeout = 3;
 
 // =============================================================================
+// ТОП-УРОВНЕВЫЕ ФУНКЦИИ ДЛЯ ВИДЖЕТА (работают без UI, в т.ч. когда приложение закрыто)
+// =============================================================================
+
+/// Отправка WoL (без UI). Используется виджетом и экраном.
+Future<void> sendWol() async {
+  final ipValidation = IPAddress.validate(kBroadcastIp);
+  if (!ipValidation.state) {
+    print('❌ Ошибка валидации IP: ${ipValidation.error}');
+    return;
+  }
+  final macValidation = MACAddress.validate(kPcMac);
+  if (!macValidation.state) {
+    print('❌ Ошибка валидации MAC: ${macValidation.error}');
+    return;
+  }
+  final ipAddress = IPAddress(kBroadcastIp);
+  final macAddress = MACAddress(kPcMac);
+  final wakeOnLan = WakeOnLAN(ipAddress, macAddress);
+  try {
+    await wakeOnLan.wake();
+    print('✅ WoL-пакет успешно отправлен');
+  } catch (e) {
+    print('❌ Ошибка отправки WoL: $e');
+  }
+}
+
+/// Отправка UDP-команды выключения (без UI).
+Future<void> sendUdpShutdown() async {
+  RawDatagramSocket? udpSocket;
+  try {
+    udpSocket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
+    udpSocket.broadcastEnabled = true;
+    final List<int> data = utf8.encode(kShutdownCommand);
+    udpSocket.send(data, InternetAddress(kPcIp), kUdpPort);
+    print('✅ UDP-команда отправлена');
+    await Future.delayed(const Duration(milliseconds: 100));
+  } catch (e) {
+    print('❌ Ошибка отправки UDP: $e');
+  } finally {
+    udpSocket?.close();
+  }
+}
+
+/// Вызывается при нажатии на виджет, даже когда приложение выключено.
+@pragma('vm:entry-point')
+Future<void> widgetBackgroundCallback(Uri? uri) async {
+  // Логи для проверки в logcat (фильтр: PC_WIDGET), когда приложение не запущено
+  print('[PC_WIDGET] Background callback started, uri=$uri');
+  try {
+    final status = await HomeWidget.getWidgetData<String>('pc_status', defaultValue: 'off');
+    print('[PC_WIDGET] pc_status=$status -> ${status == 'on' ? "отправка UDP shutdown" : "отправка WoL"}');
+    if (status == 'on') {
+      await sendUdpShutdown();
+    } else {
+      await sendWol();
+    }
+    await Future.delayed(const Duration(seconds: 1));
+    await HomeWidget.updateWidget(name: 'HomeWidgetProvider');
+    print('[PC_WIDGET] Callback finished, widget updated');
+  } catch (e, st) {
+    print('[PC_WIDGET] ERROR in callback: $e');
+    print('[PC_WIDGET] $st');
+  }
+}
+
+// =============================================================================
 // ГЛАВНОЕ ПРИЛОЖЕНИЕ
 // =============================================================================
 
-void main()async {
+void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-      runApp(const MyApp());
+  await HomeWidget.registerBackgroundCallback(widgetBackgroundCallback);
+  print('[PC_WIDGET] Background callback registered (tap widget when app closed -> this callback runs)');
+  runApp(const MyApp());
 }
 
 class MyApp extends StatelessWidget {
@@ -62,128 +131,146 @@ class PcControlScreen extends StatefulWidget {
   State<PcControlScreen> createState() => _PcControlScreenState();
 }
 
+/// Статус ПК: совпадает с виджетом и нативным кодом.
+const String _statusOn = 'on';
+const String _statusOff = 'off';
+const String _statusPendingWol = 'pending_wol';
+const String _statusPendingShutdown = 'pending_shutdown';
+
 class _PcControlScreenState extends State<PcControlScreen> {
-  bool _isPcOnline = false;   // true = ПК включён (зелёный), false = выключен (красный)
-  bool _isLoading = true;     // для отображения индикатора загрузки при первом запуске
+  /// Единый источник правды: on | off | pending_wol | pending_shutdown
+  String _pcStatus = _statusOff;
+  bool _isLoading = true; // только первая загрузка при старте
   Timer? _statusTimer;
+
+  static const _widgetSyncChannel = MethodChannel('com.example.shutdowner2/widget_sync');
 
   @override
   void initState() {
     super.initState();
-    _checkStatusPeriodically();
+    _saveWidgetConfig();
+    _loadStateFromWidget().then((_) {
+      if (mounted) _checkStatusPeriodically();
+    });
     HomeWidget.widgetClicked.listen((Uri? uri) {
-      print('🔔 Виджет нажат');
       _onButtonPressed();
     });
+    _widgetSyncChannel.setMethodCallHandler(_onWidgetSyncCall);
   }
-  void _setupHomeWidgetListener() {
-    HomeWidget.widgetClicked.listen((Uri? uri) {
-      print('🔔 Виджет нажат');
-      _onButtonPressed();
-    });
+
+  /// Вызывается нативным кодом при нажатии на виджет — синхронизируем UI с виджетом.
+  Future<dynamic> _onWidgetSyncCall(MethodCall call) async {
+    if (call.method != 'widgetDidTap') return null;
+    final status = await HomeWidget.getWidgetData<String>('pc_status', defaultValue: _statusOff);
+    if (mounted && status != null) {
+      setState(() => _pcStatus = status);
+    }
+    return null;
+  }
+
+  /// Синхронизация с виджетом при старте (читаем то, что мог записать нативный код).
+  Future<void> _loadStateFromWidget() async {
+    try {
+      final status = await HomeWidget.getWidgetData<String>('pc_status', defaultValue: _statusOff);
+      if (status != null && mounted) {
+        setState(() {
+          _pcStatus = status;
+          _isLoading = false;
+        });
+      } else if (mounted) {
+        setState(() => _isLoading = false);
+      }
+    } catch (_) {
+      if (mounted) setState(() => _isLoading = false);
+    }
+  }
+
+  /// Сохраняет конфиг в виджет (нативный код читает при нажатии и при периодической проверке).
+  Future<void> _saveWidgetConfig() async {
+    try {
+      await HomeWidget.saveWidgetData<String>('pc_ip', kPcIp);
+      await HomeWidget.saveWidgetData<String>('broadcast_ip', kBroadcastIp);
+      await HomeWidget.saveWidgetData<String>('pc_mac', kPcMac);
+      await HomeWidget.saveWidgetData<String>('udp_port', kUdpPort.toString());
+      await HomeWidget.saveWidgetData<String>('shutdown_cmd', kShutdownCommand);
+      await HomeWidget.saveWidgetData<String>('tcp_check_port', kTcpCheckPort.toString());
+      await HomeWidget.saveWidgetData<String>('connect_timeout_sec', kConnectTimeout.toString());
+    } catch (e) {
+      print('❌ Ошибка сохранения конфига виджета: $e');
+    }
   }
 
   /// Запускает периодическую проверку статуса (каждые 5 секунд)
   void _checkStatusPeriodically() {
-    print('🔄 Запуск периодической проверки статуса');
-    _checkStatus(); // первая проверка сразу
-    _statusTimer = Timer.periodic(const Duration(seconds: 5), (_) {
-      print('⏰ Таймер сработал, проверяем статус...');
-      _checkStatus();
-    });
+    _checkStatus();
+    _statusTimer = Timer.periodic(const Duration(seconds: 5), (_) => _checkStatus());
   }
 
-  /// Проверяет, включён ли ПК, через TCP-соединение
-  Future<void> _checkStatus() async {
-    print('🔍 Проверка статуса ПК: попытка подключиться к $kPcIp:$kTcpCheckPort (таймаут $kConnectTimeout сек)');
+  /// Обновляет состояние и виджет (единый источник правды с нативным кодом).
+  Future<void> _applyStatus(String status, {int? shutdownFailCount}) async {
+    if (!mounted) return;
+    setState(() => _pcStatus = status);
     try {
-      // Пытаемся подключиться к TCP-порту
+      await HomeWidget.saveWidgetData<String>('pc_status', status);
+      if (shutdownFailCount != null) {
+        await HomeWidget.saveWidgetData<String>('shutdown_fail_count', shutdownFailCount.toString());
+      }
+      await HomeWidget.updateWidget(name: 'HomeWidgetProvider');
+    } catch (e) {
+      print('❌ Ошибка сохранения статуса: $e');
+    }
+  }
+
+  /// Проверяет доступность ПК по TCP; для pending-режимов обновляет счётчики/результат.
+  Future<void> _checkStatus() async {
+    bool isOnline;
+    try {
       final socket = await Socket.connect(kPcIp, kTcpCheckPort,
           timeout: Duration(seconds: kConnectTimeout));
-      // Если успешно – ПК включён
-      print('✅ TCP-подключение успешно установлено к $kPcIp:$kTcpCheckPort');
-      socket.destroy(); // закрываем сокет, он нам больше не нужен
-      _updateStatus(true);
-    } catch (e) {
-      // Ошибка подключения (таймаут, refused) – считаем ПК выключенным
-      print('❌ Ошибка TCP-подключения: $e');
-      _updateStatus(false);
+      socket.destroy();
+      isOnline = true;
+    } catch (_) {
+      isOnline = false;
+    }
+
+    switch (_pcStatus) {
+      case _statusPendingWol:
+        if (isOnline) {
+          await _applyStatus(_statusOn);
+        }
+        break;
+      case _statusPendingShutdown:
+        final countStr = await HomeWidget.getWidgetData<String>('shutdown_fail_count', defaultValue: '0');
+        var failCount = int.tryParse(countStr ?? '0') ?? 0;
+        if (isOnline) {
+          failCount = 0;
+          await _applyStatus(_statusPendingShutdown, shutdownFailCount: 0);
+        } else {
+          failCount++;
+          if (failCount >= 3) {
+            await _applyStatus(_statusOff);
+          } else {
+            await HomeWidget.saveWidgetData<String>('shutdown_fail_count', failCount.toString());
+            await HomeWidget.updateWidget(name: 'HomeWidgetProvider');
+          }
+        }
+        break;
+      default:
+        final newStatus = isOnline ? _statusOn : _statusOff;
+        if (_pcStatus != newStatus) await _applyStatus(newStatus);
     }
   }
 
-  void _updateStatus(bool isOnline)async {
-    print('📱 Обновление статуса: ${isOnline ? "ВКЛЮЧЁН" : "ВЫКЛЮЧЕН"}');
-    if (_isPcOnline != isOnline || _isLoading) {
-      setState(() {
-        _isPcOnline = isOnline;
-        _isLoading = false;  // <-- обязательно сбрасываем загрузку
-      });
-      print('🔄 Статус изменён на экране: ${isOnline ? "Зелёный" : "Красный"}');
-      try {
-        await HomeWidget.saveWidgetData<String>('pc_status', isOnline ? 'on' : 'off');
-        print('✅ Данные сохранены в виджет');
-        await HomeWidget.updateWidget(name: 'HomeWidgetProvider');
-        print('✅ Виджет обновлён');
-      } catch (e) {
-        print('❌ Ошибка при работе с виджетом: $e');
-      }
-    } else {
-      print('⏸️ Статус не изменился');
-    }
-  }
-
-  /// Отправка Wake-on-LAN пакета с использованием пакета wake_on_lan
+  /// Отправка Wake-on-LAN (использует общую функцию + показывает SnackBar)
   Future<void> _sendWol() async {
-    print('📤 Отправка WoL-пакета на $kBroadcastIp, MAC: $kPcMac');
-    // Валидируем и создаём объекты IPAddress и MACAddress
-    final ipValidation = IPAddress.validate(kBroadcastIp);
-    if (!ipValidation.state) {
-      print('❌ Ошибка валидации IP: ${ipValidation.error}');
-      _showSnackBar('Ошибка IP: ${ipValidation.error}');
-      return;
-    }
-    final macValidation = MACAddress.validate(kPcMac);
-    if (!macValidation.state) {
-      print('❌ Ошибка валидации MAC: ${macValidation.error}');
-      _showSnackBar('Ошибка MAC: ${macValidation.error}');
-      return;
-    }
-
-    final ipAddress = IPAddress(kBroadcastIp);
-    final macAddress = MACAddress(kPcMac);
-    final wakeOnLan = WakeOnLAN(ipAddress, macAddress);
-
-    try {
-      await wakeOnLan.wake();
-      print('✅ WoL-пакет успешно отправлен');
-      _showSnackBar('WoL-пакет отправлен');
-    } catch (e) {
-      print('❌ Ошибка отправки WoL: $e');
-      _showSnackBar('Ошибка отправки WoL: $e');
-    }
+    await sendWol();
+    _showSnackBar('WoL-пакет отправлен');
   }
 
-  /// Отправка UDP-команды на выключение ПК
+  /// Отправка UDP-команды выключения (использует общую функцию + показывает SnackBar)
   Future<void> _sendUdpShutdown() async {
-    print('📤 Отправка UDP-команды "$kShutdownCommand" на $kPcIp:$kUdpPort');
-    RawDatagramSocket? udpSocket;
-    try {
-      udpSocket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
-      udpSocket.broadcastEnabled = true;
-
-      final List<int> data = utf8.encode(kShutdownCommand);
-      udpSocket.send(data, InternetAddress(kPcIp), kUdpPort);
-
-      print('✅ UDP-команда отправлена');
-      _showSnackBar('Команда выключения отправлена');
-
-      await Future.delayed(const Duration(milliseconds: 100));
-    } catch (e) {
-      print('❌ Ошибка отправки UDP: $e');
-      _showSnackBar('Ошибка отправки UDP: $e');
-    } finally {
-      udpSocket?.close();
-    }
+    await sendUdpShutdown();
+    _showSnackBar('Команда выключения отправлена');
   }
 
   void _showSnackBar(String message) {
@@ -192,55 +279,59 @@ class _PcControlScreenState extends State<PcControlScreen> {
         .showSnackBar(SnackBar(content: Text(message)));
   }
 
-  /// Обработчик нажатия на большую кнопку
+  /// Обработчик нажатия на большую кнопку (логика как у виджета).
   void _onButtonPressed() async {
     if (_isLoading) return;
 
-    if (_isPcOnline) {
-      // ПК включён – показываем диалог подтверждения
-      final bool? confirm = await showDialog<bool>(
-        context: context,
-        builder: (ctx) => AlertDialog(
-          title: const Text('Подтверждение'),
-          content: const Text('Вы действительно хотите выключить ПК?'),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(ctx, false),
-              child: const Text('Нет'),
-            ),
-            ElevatedButton(
-              onPressed: () => Navigator.pop(ctx, true),
-              style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
-              child: const Text('Да, выключить'),
-            ),
-          ],
-        ),
-      );
+    switch (_pcStatus) {
+      case _statusOn:
+        final confirm = await showDialog<bool>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text('Подтверждение'),
+            content: const Text('Вы действительно хотите выключить ПК?'),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, false),
+                child: const Text('Нет'),
+              ),
+              ElevatedButton(
+                onPressed: () => Navigator.pop(ctx, true),
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+                child: const Text('Да, выключить'),
+              ),
+            ],
+          ),
+        );
+        if (confirm != true) return;
+        await _sendUdpShutdown();
+        await _applyStatus(_statusPendingShutdown, shutdownFailCount: 0);
+        _showSnackBar('Команда выключения отправлена, ожидание…');
+        break;
 
-      if (confirm != true) return; // если отмена – ничего не делаем
+      case _statusOff:
+        await _sendWol();
+        await _applyStatus(_statusPendingWol);
+        _showSnackBar('WoL отправлен, ожидание включения…');
+        break;
 
-      // Подтверждено – отправляем команду
-      setState(() => _isLoading = true);
-      await _sendUdpShutdown();
-      // После отправки команды дадим небольшой запас времени и проверим статус
-      await Future.delayed(const Duration(seconds: 1));
-      _checkStatus();
-    } else {
-      // ПК выключен – отправляем WoL без диалога
-      setState(() => _isLoading = true);
-      await _sendWol();
-      // После отправки WoL тоже проверяем статус
-      await Future.delayed(const Duration(seconds: 1));
-      _checkStatus();
+      case _statusPendingWol:
+        await _applyStatus(_statusOff);
+        _showSnackBar('Ожидание отменено');
+        break;
+
+      case _statusPendingShutdown:
+        await _applyStatus(_statusOn);
+        _showSnackBar('Ожидание отменено');
+        break;
     }
   }
+
   Future<void> _manualCheck() async {
-    if (_isLoading) return; // если уже идёт проверка – игнорируем
-    print('🔄 Ручная проверка статуса');
-    setState(() => _isLoading = true); // показываем индикатор загрузки на основной кнопке
-    await _checkStatus(); // вызываем существующую проверку
-    setState(() => _isLoading = false); // скрываем индикатор после завершения
-    // можно показать уведомление:
+    if (_isLoading) return;
+    setState(() => _isLoading = true);
+    await _checkStatus();
+    if (mounted) setState(() => _isLoading = false);
     _showSnackBar('Статус обновлён');
   }
 
@@ -248,6 +339,49 @@ class _PcControlScreenState extends State<PcControlScreen> {
   void dispose() {
     _statusTimer?.cancel();
     super.dispose();
+  }
+
+  String _statusTitle() {
+    switch (_pcStatus) {
+      case _statusOn:
+        return 'ПК ВКЛЮЧЁН';
+      case _statusOff:
+        return 'ПК ВЫКЛЮЧЕН';
+      case _statusPendingWol:
+        return 'Ожидание включения…';
+      case _statusPendingShutdown:
+        return 'Ожидание выключения…';
+      default:
+        return 'ПК ВЫКЛЮЧЕН';
+    }
+  }
+
+  Color _statusColor() {
+    switch (_pcStatus) {
+      case _statusOn:
+        return Colors.green;
+      case _statusOff:
+        return Colors.red;
+      case _statusPendingWol:
+      case _statusPendingShutdown:
+        return Colors.orange;
+      default:
+        return Colors.red;
+    }
+  }
+
+  String _buttonLabel() {
+    switch (_pcStatus) {
+      case _statusOn:
+        return 'ВЫКЛЮЧИТЬ';
+      case _statusOff:
+        return 'ВКЛЮЧИТЬ';
+      case _statusPendingWol:
+      case _statusPendingShutdown:
+        return 'Ожидание...';
+      default:
+        return 'ВКЛЮЧИТЬ';
+    }
   }
 
   @override
@@ -261,37 +395,34 @@ class _PcControlScreenState extends State<PcControlScreen> {
         child: _isLoading
             ? const CircularProgressIndicator()
             : Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Text(
-              _isPcOnline ? 'ПК ВКЛЮЧЁН' : 'ПК ВЫКЛЮЧЕН',
-              style: TextStyle(
-                fontSize: 24,
-                color: _isPcOnline ? Colors.green : Colors.red,
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Text(
+                    _statusTitle(),
+                    style: TextStyle(fontSize: 24, color: _statusColor()),
+                  ),
+                  const SizedBox(height: 40),
+                  ElevatedButton(
+                    onPressed: _onButtonPressed,
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: _statusColor(),
+                      foregroundColor: Colors.white,
+                      minimumSize: const Size(200, 200),
+                      shape: const CircleBorder(),
+                    ),
+                    child: Text(
+                      _buttonLabel(),
+                      style: const TextStyle(fontSize: 20),
+                    ),
+                  ),
+                  const SizedBox(height: 20),
+                  TextButton.icon(
+                    onPressed: _isLoading ? null : _manualCheck,
+                    icon: const Icon(Icons.refresh),
+                    label: const Text('Проверить статус'),
+                  ),
+                ],
               ),
-            ),
-            const SizedBox(height: 40),
-            ElevatedButton(
-              onPressed: _onButtonPressed,
-              style: ElevatedButton.styleFrom(
-                backgroundColor: _isPcOnline ? Colors.green : Colors.red,
-                foregroundColor: Colors.white,
-                minimumSize: const Size(200, 200),
-                shape: const CircleBorder(),
-              ),
-              child: Text(
-                _isPcOnline ? 'ВЫКЛЮЧИТЬ' : 'ВКЛЮЧИТЬ',
-                style: const TextStyle(fontSize: 20),
-              ),
-            ),
-            const SizedBox(height: 20), // небольшой отступ
-            TextButton.icon(
-              onPressed: _isLoading ? null : _manualCheck, // запрещаем нажатие во время загрузки
-              icon: const Icon(Icons.refresh),
-              label: const Text('Проверить статус'),
-            ),
-          ],
-        ),
       ),
     );
   }

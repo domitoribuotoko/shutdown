@@ -1,10 +1,28 @@
 <?xml version="1.0" encoding="utf-8"?>
-<TextView xmlns:android="http://schemas.android.com/apk/res/android"
-    android:id="@+id/widget_button"
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/widget_root"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:gravity="center"
-    android:text="Загрузка..."
-    android:textColor="#FFFFFF"
-    android:background="#FF5722"
-    android:textSize="16sp"/>
+    android:padding="6dp">
+    <TextView
+        android:id="@+id/widget_circle_bg"
+        android:layout_width="48dp"
+        android:layout_height="48dp"
+        android:layout_gravity="center"
+        android:background="@drawable/widget_circle_off" />
+    <ImageView
+        android:id="@+id/widget_icon"
+        android:layout_width="32dp"
+        android:layout_height="32dp"
+        android:layout_gravity="center"
+        android:scaleType="fitCenter"
+        android:src="@drawable/ic_widget_power_off"
+        android:contentDescription="@null" />
+    <ProgressBar
+        android:id="@+id/widget_progress"
+        android:layout_width="48dp"
+        android:layout_height="48dp"
+        android:layout_gravity="center"
+        android:indeterminateDrawable="@drawable/progress_indeterminate_orange"
+        android:visibility="gone" />
+</FrameLayout>

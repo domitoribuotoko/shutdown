@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Тонкое кольцо с градиентом (без бордера); толщина ~3dp при 48dp view -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="ring"
+    android:innerRadiusRatio="2.5"
+    android:thicknessRatio="14"
+    android:useLevel="false">
+    <gradient
+        android:type="sweep"
+        android:startColor="#FF9800"
+        android:endColor="#00FF9800"
+        android:angle="0" />
+</shape>
