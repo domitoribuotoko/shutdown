@@ -5,6 +5,7 @@ import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.net.wifi.WifiManager
 import android.util.Log
 import android.view.View
 import android.widget.RemoteViews
@@ -46,8 +47,14 @@ class WidgetActionReceiver : BroadcastReceiver() {
             "off" -> {
                 Log.d("PC_WIDGET", "Sending WoL to $broadcastIp, MAC $pcMac (up to 3 attempts)")
                 val wolOk = trySendWolWithRetries(broadcastIp, pcMac, maxAttempts = 3)
-                newStatus = if (wolOk) "pending_wol" else "off"
+                val sameSubnet = isOnSameSubnetAsPc(context, pcIp)
+                newStatus = when {
+                    !wolOk -> "off"
+                    !sameSubnet -> "off"
+                    else -> "pending_wol"
+                }
                 if (!wolOk) Log.w("PC_WIDGET", "WoL failed after 3 attempts, staying in off")
+                if (wolOk && !sameSubnet) Log.w("PC_WIDGET", "Device not on same subnet as PC, staying in off")
             }
             "pending_wol" -> {
                 Log.d("PC_WIDGET", "Cancel waiting (WoL) -> off")
@@ -112,6 +119,21 @@ class WidgetActionReceiver : BroadcastReceiver() {
             if (attempt < maxAttempts - 1) Thread.sleep(WOL_RETRY_DELAY_MS)
         }
         return false
+    }
+
+    /**
+     * Проверяет, что устройство в той же подсети, что и ПК (WoL broadcast доходит только в своей подсети).
+     * Если не удаётся определить (нет WiFi и т.п.) — возвращает true, чтобы не ломать сценарии.
+     */
+    private fun isOnSameSubnetAsPc(context: Context, pcIp: String): Boolean {
+        val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager ?: return true
+        val ipInt = wifiManager.connectionInfo?.ipAddress ?: 0
+        if (ipInt == 0) return true
+        @Suppress("DEPRECATION")
+        val deviceIp = "${ipInt and 0xFF}.${ipInt shr 8 and 0xFF}.${ipInt shr 16 and 0xFF}.${ipInt shr 24 and 0xFF}"
+        val devicePrefix = deviceIp.split(".").take(3).joinToString(".")
+        val pcPrefix = pcIp.split(".").take(3).joinToString(".")
+        return devicePrefix == pcPrefix
     }
 
     private fun sendUdpShutdown(ip: String, port: Int, command: String) {

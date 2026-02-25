@@ -97,47 +97,40 @@ Future<bool> sendWolWithRetries(int maxAttempts) async {
   return false;
 }
 
-/// Проверка «доступна ли сеть до ПК». Делает короткий TCP-подключение к IP ПК.
-/// Возвращает false только при явной ошибке «сеть недоступна» (ENETUNREACH и т.п.),
-/// чтобы во Flutter не переходить в ожидание при WoL, когда UDP send() не бросает.
-Future<bool> isPcNetworkReachable() async {
-  Socket? socket;
+/// Проверяет, что устройство в той же подсети, что и ПК (как в нативном виджете).
+/// WoL broadcast доходит только в своей подсети; при другой подсети не переходим в ожидание.
+/// Если не удаётся определить — возвращает true, чтобы не ломать сценарии.
+Future<bool> isOnSameSubnetAsPc() async {
   try {
-    socket = await Socket.connect(
-      InternetAddress(kPcIp),
-      kTcpCheckPort,
-      timeout: const Duration(seconds: 2),
+    final interfaces = await NetworkInterface.list(
+      type: InternetAddressType.IPv4,
+      includeLoopback: false,
     );
-    return true; // соединение есть — мы в сети
-  } on SocketException catch (e) {
-    final msg = (e.message ?? '').toLowerCase();
-    final osMsg = (e.osError?.message ?? '').toLowerCase();
-    if (msg.contains('unreachable') ||
-        msg.contains('enetunreach') ||
-        msg.contains('no route') ||
-        msg.contains('network is unreachable') ||
-        osMsg.contains('unreachable') ||
-        osMsg.contains('enetunreach') ||
-        osMsg.contains('no route')) {
-      print('❌ Сеть до ПК недоступна: $e');
-      return false;
+    String? deviceIp;
+    for (final iface in interfaces) {
+      for (final addr in iface.addresses) {
+        final a = addr.address;
+        if (a.split('.').length == 4) {
+          deviceIp = a;
+          break;
+        }
+      }
+      if (deviceIp != null) break;
     }
-    // connection refused / timeout — мы в сети, ПК просто выключен
-    return true;
-  } on OSError catch (e) {
-    final msg = (e.message ?? '').toLowerCase();
-    if (msg.contains('unreachable') ||
-        msg.contains('enetunreach') ||
-        msg.contains('no route')) {
-      print('❌ Сеть до ПК недоступна: $e');
+    if (deviceIp == null) return true;
+    final devicePrefix = deviceIp.split('.').take(3).join('.');
+    final pcParts = kPcIp.split('.');
+    if (pcParts.length != 4) return true;
+    final pcPrefix = pcParts.take(3).join('.');
+    if (devicePrefix != pcPrefix) {
+      print('❌ Другая подсеть: устройство $deviceIp, ПК $kPcIp');
       return false;
     }
     return true;
-  } catch (_) {
-    return true; // при неизвестной ошибке разрешаем попытку WoL
-  } finally {
-    await socket?.close();
+  } catch (e) {
+    print('❌ Не удалось получить подсеть: $e');
   }
+  return true;
 }
 
 /// Отправка UDP-команды выключения (без UI).
@@ -424,7 +417,7 @@ class _PcControlScreenState extends State<PcControlScreen> {
         break;
 
       case _statusOff: {
-        if (!await isPcNetworkReachable()) {
+        if (!await isOnSameSubnetAsPc()) {
           _showSnackBar('Сеть недоступна, WoL не отправлен');
           return;
         }
