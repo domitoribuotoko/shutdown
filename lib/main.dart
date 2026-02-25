@@ -138,10 +138,11 @@ const String _statusPendingWol = 'pending_wol';
 const String _statusPendingShutdown = 'pending_shutdown';
 
 class _PcControlScreenState extends State<PcControlScreen> {
-  /// Единый источник правды: on | off | pending_wol | pending_shutdown
   String _pcStatus = _statusOff;
-  bool _isLoading = true; // только первая загрузка при старте
+  bool _isLoading = true;
   Timer? _statusTimer;
+  /// Для pending_wol: первый опрос через 10 сек, дальше каждые 2 сек
+  bool _pendingWolFirstCheck = true;
 
   static const _widgetSyncChannel = MethodChannel('com.example.shutdowner2/widget_sync');
 
@@ -158,12 +159,15 @@ class _PcControlScreenState extends State<PcControlScreen> {
     _widgetSyncChannel.setMethodCallHandler(_onWidgetSyncCall);
   }
 
-  /// Вызывается нативным кодом при нажатии на виджет — синхронизируем UI с виджетом.
   Future<dynamic> _onWidgetSyncCall(MethodCall call) async {
     if (call.method != 'widgetDidTap') return null;
     final status = await HomeWidget.getWidgetData<String>('pc_status', defaultValue: _statusOff);
     if (mounted && status != null) {
-      setState(() => _pcStatus = status);
+      setState(() {
+        _pcStatus = status;
+        if (status == _statusPendingWol) _pendingWolFirstCheck = true;
+      });
+      _scheduleNextCheck();
     }
     return null;
   }
@@ -175,6 +179,7 @@ class _PcControlScreenState extends State<PcControlScreen> {
       if (status != null && mounted) {
         setState(() {
           _pcStatus = status;
+          if (status == _statusPendingWol) _pendingWolFirstCheck = true;
           _isLoading = false;
         });
       } else if (mounted) {
@@ -200,10 +205,39 @@ class _PcControlScreenState extends State<PcControlScreen> {
     }
   }
 
-  /// Запускает периодическую проверку статуса (каждые 5 секунд)
+  /// Запускает проверку и планирует следующую: WoL — 10 сек первый раз, потом 2 сек; shutdown — без задержки; on/off — 5 сек.
   void _checkStatusPeriodically() {
-    _checkStatus();
-    _statusTimer = Timer.periodic(const Duration(seconds: 5), (_) => _checkStatus());
+    _scheduleNextCheck(initial: true);
+  }
+
+  void _scheduleNextCheck({bool initial = false}) {
+    if (!mounted) return;
+    _statusTimer?.cancel();
+    Duration delay;
+    switch (_pcStatus) {
+      case _statusPendingWol:
+        delay = _pendingWolFirstCheck ? const Duration(seconds: 10) : const Duration(seconds: 2);
+        if (_pendingWolFirstCheck) _pendingWolFirstCheck = false;
+        break;
+      case _statusPendingShutdown:
+        delay = Duration.zero;
+        break;
+      default:
+        delay = const Duration(seconds: 5);
+        break;
+    }
+    void run() async {
+      await _checkStatus();
+      if (mounted) _scheduleNextCheck();
+    }
+    if (initial && _pcStatus == _statusPendingWol && _pendingWolFirstCheck) {
+      // Первый запрос при ожидании WoL — через 10 сек, не сразу
+      _statusTimer = Timer(delay, run);
+    } else if (initial) {
+      run();
+    } else {
+      _statusTimer = Timer(delay, run);
+    }
   }
 
   /// Обновляет состояние и виджет (единый источник правды с нативным кодом).
@@ -307,12 +341,15 @@ class _PcControlScreenState extends State<PcControlScreen> {
         await _sendUdpShutdown();
         await _applyStatus(_statusPendingShutdown, shutdownFailCount: 0);
         _showSnackBar('Команда выключения отправлена, ожидание…');
+        _scheduleNextCheck();
         break;
 
       case _statusOff:
         await _sendWol();
+        setState(() => _pendingWolFirstCheck = true);
         await _applyStatus(_statusPendingWol);
         _showSnackBar('WoL отправлен, ожидание включения…');
+        _scheduleNextCheck();
         break;
 
       case _statusPendingWol:

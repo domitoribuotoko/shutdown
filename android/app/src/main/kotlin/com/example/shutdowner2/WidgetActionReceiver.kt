@@ -9,6 +9,7 @@ import android.util.Log
 import android.view.View
 import android.widget.RemoteViews
 import java.net.DatagramPacket
+import java.util.concurrent.TimeUnit
 import java.net.DatagramSocket
 import java.net.InetAddress
 
@@ -62,7 +63,18 @@ class WidgetActionReceiver : BroadcastReceiver() {
         prefs.edit().putString(KEY_PC_STATUS, newStatus).apply()
         updateWidget(context, newStatus)
         Log.d("PC_WIDGET", "Action done, widget status -> $newStatus")
-        // Уведомить открытое приложение, чтобы UI синхронизировался с виджетом
+        // Цепочка проверок через AlarmManager (работает при закрытом приложении)
+        when (newStatus) {
+            "pending_wol" -> {
+                WidgetStatusAlarmReceiver.scheduleNextCheck(context.applicationContext, 10L)
+                Log.d("PC_WIDGET", "Scheduled first status check in 10 sec (WoL, AlarmManager)")
+            }
+            "pending_shutdown" -> {
+                WidgetStatusAlarmReceiver.scheduleNextCheck(context.applicationContext, 1L)
+                Log.d("PC_WIDGET", "Scheduled first status check in 1 sec (shutdown, AlarmManager)")
+            }
+            else -> { }
+        }
         context.sendBroadcast(
             Intent(WidgetSyncBridge.ACTION_WIDGET_TAPPED_SYNC).setPackage(context.packageName)
         )
