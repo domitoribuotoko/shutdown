@@ -3,10 +3,10 @@
 import 'dart:io';
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:home_widget/home_widget.dart';
-import 'package:wake_on_lan/wake_on_lan.dart';
 
 // =============================================================================
 // НАСТРОЙКИ (вшиты константами)
@@ -38,26 +38,105 @@ const int kConnectTimeout = 3;
 // ТОП-УРОВНЕВЫЕ ФУНКЦИИ ДЛЯ ВИДЖЕТА (работают без UI, в т.ч. когда приложение закрыто)
 // =============================================================================
 
-/// Отправка WoL (без UI). Используется виджетом и экраном.
-Future<void> sendWol() async {
-  final ipValidation = IPAddress.validate(kBroadcastIp);
-  if (!ipValidation.state) {
-    print('❌ Ошибка валидации IP: ${ipValidation.error}');
-    return;
+/// Собирает WoL magic-пакет (6×0xFF + 16×MAC) и возвращает null при неверном MAC.
+Uint8List? _buildWolPacket(String mac) {
+  final parts = mac.replaceAll('-', ':').split(':');
+  if (parts.length != 6) return null;
+  final macBytes = <int>[];
+  for (final p in parts) {
+    final b = int.tryParse(p, radix: 16);
+    if (b == null || b < 0 || b > 255) return null;
+    macBytes.add(b);
   }
-  final macValidation = MACAddress.validate(kPcMac);
-  if (!macValidation.state) {
-    print('❌ Ошибка валидации MAC: ${macValidation.error}');
-    return;
+  final packet = Uint8List(6 + 16 * 6);
+  for (var i = 0; i < 6; i++) packet[i] = 0xFF;
+  for (var i = 0; i < 16; i++) {
+    for (var j = 0; j < 6; j++) packet[6 + i * 6 + j] = macBytes[j];
   }
-  final ipAddress = IPAddress(kBroadcastIp);
-  final macAddress = MACAddress(kPcMac);
-  final wakeOnLan = WakeOnLAN(ipAddress, macAddress);
+  return packet;
+}
+
+/// Одна попытка отправки WoL через RawDatagramSocket. Возвращает true только при успешной отправке
+/// (при ENETUNREACH / недоступной сети бросает/ловим и возвращаем false, как в нативном коде).
+Future<bool> sendWol() async {
+  final packet = _buildWolPacket(kPcMac);
+  if (packet == null) {
+    print('❌ Неверный MAC: $kPcMac');
+    return false;
+  }
+  RawDatagramSocket? socket;
   try {
-    await wakeOnLan.wake();
+    socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
+    socket.broadcastEnabled = true;
+    final target = InternetAddress(kBroadcastIp);
+    socket.send(packet, target, 9); // WoL port 9
     print('✅ WoL-пакет успешно отправлен');
+    return true;
+  } on SocketException catch (e) {
+    print('❌ Ошибка отправки WoL: $e');
+    return false;
+  } on OSError catch (e) {
+    print('❌ Ошибка отправки WoL: $e');
+    return false;
   } catch (e) {
     print('❌ Ошибка отправки WoL: $e');
+    return false;
+  } finally {
+    socket?.close();
+  }
+}
+
+/// До [maxAttempts] попыток WoL. Возвращает true, если хотя бы одна успешна.
+Future<bool> sendWolWithRetries(int maxAttempts) async {
+  for (var attempt = 0; attempt < maxAttempts; attempt++) {
+    if (await sendWol()) return true;
+    if (attempt < maxAttempts - 1) {
+      await Future<void>.delayed(const Duration(milliseconds: 400));
+    }
+  }
+  return false;
+}
+
+/// Проверка «доступна ли сеть до ПК». Делает короткий TCP-подключение к IP ПК.
+/// Возвращает false только при явной ошибке «сеть недоступна» (ENETUNREACH и т.п.),
+/// чтобы во Flutter не переходить в ожидание при WoL, когда UDP send() не бросает.
+Future<bool> isPcNetworkReachable() async {
+  Socket? socket;
+  try {
+    socket = await Socket.connect(
+      InternetAddress(kPcIp),
+      kTcpCheckPort,
+      timeout: const Duration(seconds: 2),
+    );
+    return true; // соединение есть — мы в сети
+  } on SocketException catch (e) {
+    final msg = (e.message ?? '').toLowerCase();
+    final osMsg = (e.osError?.message ?? '').toLowerCase();
+    if (msg.contains('unreachable') ||
+        msg.contains('enetunreach') ||
+        msg.contains('no route') ||
+        msg.contains('network is unreachable') ||
+        osMsg.contains('unreachable') ||
+        osMsg.contains('enetunreach') ||
+        osMsg.contains('no route')) {
+      print('❌ Сеть до ПК недоступна: $e');
+      return false;
+    }
+    // connection refused / timeout — мы в сети, ПК просто выключен
+    return true;
+  } on OSError catch (e) {
+    final msg = (e.message ?? '').toLowerCase();
+    if (msg.contains('unreachable') ||
+        msg.contains('enetunreach') ||
+        msg.contains('no route')) {
+      print('❌ Сеть до ПК недоступна: $e');
+      return false;
+    }
+    return true;
+  } catch (_) {
+    return true; // при неизвестной ошибке разрешаем попытку WoL
+  } finally {
+    await socket?.close();
   }
 }
 
@@ -297,8 +376,8 @@ class _PcControlScreenState extends State<PcControlScreen> {
 
   /// Отправка Wake-on-LAN (использует общую функцию + показывает SnackBar)
   Future<void> _sendWol() async {
-    await sendWol();
-    _showSnackBar('WoL-пакет отправлен');
+    final ok = await sendWol();
+    _showSnackBar(ok ? 'WoL-пакет отправлен' : 'Не удалось отправить WoL');
   }
 
   /// Отправка UDP-команды выключения (использует общую функцию + показывает SnackBar)
@@ -344,13 +423,22 @@ class _PcControlScreenState extends State<PcControlScreen> {
         _scheduleNextCheck();
         break;
 
-      case _statusOff:
-        await _sendWol();
+      case _statusOff: {
+        if (!await isPcNetworkReachable()) {
+          _showSnackBar('Сеть недоступна, WoL не отправлен');
+          return;
+        }
+        final ok = await sendWolWithRetries(3);
+        if (!ok) {
+          _showSnackBar('Сеть недоступна, WoL не отправлен');
+          return;
+        }
         setState(() => _pendingWolFirstCheck = true);
         await _applyStatus(_statusPendingWol);
         _showSnackBar('WoL отправлен, ожидание включения…');
         _scheduleNextCheck();
         break;
+      }
 
       case _statusPendingWol:
         await _applyStatus(_statusOff);

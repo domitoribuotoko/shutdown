@@ -9,7 +9,6 @@ import android.util.Log
 import android.view.View
 import android.widget.RemoteViews
 import java.net.DatagramPacket
-import java.util.concurrent.TimeUnit
 import java.net.DatagramSocket
 import java.net.InetAddress
 
@@ -45,9 +44,10 @@ class WidgetActionReceiver : BroadcastReceiver() {
                 prefs.edit().putString(KEY_SHUTDOWN_FAIL_COUNT, "0").apply()
             }
             "off" -> {
-                Log.d("PC_WIDGET", "Sending WoL to $broadcastIp, MAC $pcMac")
-                sendWol(broadcastIp, pcMac)
-                newStatus = "pending_wol"
+                Log.d("PC_WIDGET", "Sending WoL to $broadcastIp, MAC $pcMac (up to 3 attempts)")
+                val wolOk = trySendWolWithRetries(broadcastIp, pcMac, maxAttempts = 3)
+                newStatus = if (wolOk) "pending_wol" else "off"
+                if (!wolOk) Log.w("PC_WIDGET", "WoL failed after 3 attempts, staying in off")
             }
             "pending_wol" -> {
                 Log.d("PC_WIDGET", "Cancel waiting (WoL) -> off")
@@ -80,10 +80,11 @@ class WidgetActionReceiver : BroadcastReceiver() {
         )
     }
 
-    private fun sendWol(broadcastIp: String, mac: String) {
-        try {
+    /** Отправляет один WoL-пакет. Возвращает true, если отправка прошла без исключения. */
+    private fun sendWol(broadcastIp: String, mac: String): Boolean {
+        return try {
             val macBytes = mac.split(":", "-").map { it.toInt(16).toByte() }.toByteArray()
-            if (macBytes.size != 6) return
+            if (macBytes.size != 6) return false
             val packet = ByteArray(6 + 6 * 16)
             for (i in 0..5) packet[i] = 0xFF.toByte()
             for (i in 0 until 16) System.arraycopy(macBytes, 0, packet, 6 + i * 6, 6)
@@ -94,9 +95,23 @@ class WidgetActionReceiver : BroadcastReceiver() {
                 val dp = DatagramPacket(packet, packet.size, addr, WOL_PORT)
                 socket.send(dp)
             }
+            true
         } catch (e: Exception) {
             Log.e("PC_WIDGET", "WoL error", e)
+            false
         }
+    }
+
+    /** До 3 попыток отправки WoL. Возвращает true, если хотя бы одна успешна. */
+    private fun trySendWolWithRetries(broadcastIp: String, mac: String, maxAttempts: Int = 3): Boolean {
+        repeat(maxAttempts) { attempt ->
+            if (sendWol(broadcastIp, mac)) {
+                Log.d("PC_WIDGET", "WoL sent successfully (attempt ${attempt + 1})")
+                return true
+            }
+            if (attempt < maxAttempts - 1) Thread.sleep(WOL_RETRY_DELAY_MS)
+        }
+        return false
     }
 
     private fun sendUdpShutdown(ip: String, port: Int, command: String) {
@@ -118,6 +133,7 @@ class WidgetActionReceiver : BroadcastReceiver() {
     }
 
     companion object {
+        private const val WOL_RETRY_DELAY_MS = 400L
         const val ACTION_WIDGET_TAP = "com.example.shutdowner2.WIDGET_TAP"
         const val PREFS_NAME = "HomeWidgetPreferences"
         const val KEY_PC_STATUS = "pc_status"
